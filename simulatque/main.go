@@ -10,46 +10,68 @@ import (
 	"net/http"
 	"time"
 	"os"
+	"flag"
 )
 
+const (
+	host = ":5280"
+)
+
+// a req is a request to be run by a handler
+type req struct {
+	initial time.Time
+	w http.ResponseWriter
+	r *http.Request
+}
 
 // t is a debugging tool shared by the server components
 var t = trace.New(os.Stderr, true) // or (nil, false)
-// logger goes to stdout, as do timing records for each access
-var logger = log.New(os.Stdout, "", log.Ldate | log.Ltime | log.Lshortfile)
-
-const (
-	//host = "10.92.10.201:5280"
-	host = ":5280"
-)
+var pipe chan req
+var delay = 10.0
+var count = 1
 
 
 // main starts the web server, and also a smoke test for it
 func main() {
-	defer t.Begin()()
+	// parse opts
+	flag.IntVar(&count, "servers", 1, "number of servers, default 1")
+	flag.Float64Var(&delay, "service-time", 10, "service time in milliseconds, default 10")
+	flag.Parse()
 
+	pipe = make(chan req, count)
+	for i := 0; i < count; i++ {
+		go worker(pipe)
+	}
 	go runSmokeTest()
 	startWebserver()
 }
 
-// startWebserver for all object requests
-func startWebserver() {
-	defer t.Begin()()
+// worker reads r and w from a pipe and does some work
+func worker(pipe chan req) {
+	for x := range pipe {
+		var w = x.w
 
-	// handle image vs content part of prefixes
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		defer t.Begin(r)()
-
-		t.Printf("started\n")
-		time.Sleep(10 * time.Millisecond)
-		_, err := w.Write([]byte("success"))
+		time.Sleep(time.Duration(delay) * time.Millisecond)
+		_, err := w.Write(nil)  // FIXME, fails if non-nil
+		end := time.Since(x.initial)
 		if err != nil {
 			// log and try to return 500 via the broken ResponseWriter
-			t.Printf("ERROR, could not write to ResponseWriter, %v\n", err)
+			t.Printf(`ERROR, worker could not write to ResponseWriter, "%v"\n`, err)
 			http.Error(w, err.Error(), 500)
 		}
-	})
+		end -= time.Duration(10.0 * time.Millisecond)
+		fmt.Printf("%s %f 0.010 0 %s 200 GET\n",
+			x.initial.Format("2006-01-02 15:04:05.000"),
+			end.Seconds(), x.r.RequestURI)
+	}
 
+}
+
+// startWebserver for all object requests
+func startWebserver() {
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		pipe <- req{ time.Now(),w, r}
+	})
 	err := http.ListenAndServe(host, nil) // nolint
 	if err != nil {
 		log.Fatal("ListenAndServe: ", err)
@@ -65,12 +87,15 @@ func runSmokeTest() {
 	if err != nil {
 		panic(fmt.Sprintf("Got an error in the get: %v", err))
 	}
-	body, err :=  ioutil.ReadAll(resp.Body)
+	_, err =  ioutil.ReadAll(resp.Body)
 	if err != nil {
 		panic(fmt.Sprintf("Got an error in the body read: %v", err))
 	}
-	t.Printf("\n%s\n%s\n", responseToString(resp), bodyToString(body))
-	resp.Body.Close()         // nolint
+	t.Printf("\n%s\n", responseToString(resp))
+	err = resp.Body.Close()
+	if err != nil {
+		panic(fmt.Sprintf("Got an error in the body close: %v", err))
+	}
 }
 
 // requestToString provides extra information about an http request if it can
