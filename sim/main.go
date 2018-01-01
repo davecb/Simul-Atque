@@ -1,78 +1,86 @@
 package main
 
 import (
-	"github.com/davecb/trace"
-	
 	"net/http/httputil"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"time"
-	"os"
 	"flag"
+	"strconv"
 )
 
-const (
-	host = ":5280"
-)
-
-// a req is a request to be run by a handler
-type req struct {
-	initial time.Time
-	w http.ResponseWriter
-	r *http.Request
-}
-
-// t is a debugging tool shared by the server components
-var t = trace.New(os.Stderr, true) // or (nil, false)
-var pipe chan req
-var delay = 10.0
-var count = 1
+var start = make(chan bool)
+var done = make(chan bool)
+var port = 5280
+var serviceTime = 100.0  // milliseconds
+var serviceDuration time.Duration
+var queuingCenters = 1
+var bytes = 0
+var host = ":5280"
+var verbose = false
 
 
 // main starts the web server, and also a smoke test for it
 func main() {
 	// parse opts
-	flag.IntVar(&count, "servers", 1, "number of servers, default 1")
-	flag.Float64Var(&delay, "service-time", 10, "service time in milliseconds, default 10")
+	flag.IntVar(&queuingCenters, "servers", 1, "number of servers")
+	flag.Float64Var(&serviceTime, "service-time", 100, "service time in milliseconds")
+	flag.IntVar(&bytes, "bytes", 0, "bytes to return, currently locked to 0")
+	flag.IntVar(&port, "port", 5280, "port to use")
+	flag.BoolVar(&verbose, "v", false, "verbose")
 	flag.Parse()
 
-	pipe = make(chan req, count)
-	for i := 0; i < count; i++ {
-		go worker(pipe)
+	host = ":" + strconv.FormatUint(uint64(port), 10)
+	serviceDuration = time.Duration(serviceTime) * time.Millisecond
+	for i := 0; i < queuingCenters; i++ {
+		go queuingCenter(start, done)
 	}
+
 	go runSmokeTest()
+	fmt.Print("#date      time         latency  xferTime thinkTime bytes key rc op\n")
 	startWebserver()
 }
 
-// worker reads r and w from a pipe and does some work
-func worker(pipe chan req) {
-	for x := range pipe {
-		var w = x.w
-
-		time.Sleep(time.Duration(delay) * time.Millisecond)
-		_, err := w.Write(nil)  // FIXME, fails if non-nil
-		end := time.Since(x.initial)
-		if err != nil {
-			// log and try to return 500 via the broken ResponseWriter
-			t.Printf(`ERROR, worker could not write to ResponseWriter, "%v"\n`, err)
-			http.Error(w, err.Error(), 500)
-		}
-		end -= time.Duration(10.0 * time.Millisecond)
-		fmt.Printf("%s %f 0.010 0 %s 200 GET\n",
-			x.initial.Format("2006-01-02 15:04:05.000"),
-			end.Seconds(), x.r.RequestURI)
+// queuingCenter gets work, does it and reports completion
+func queuingCenter(start, done chan bool) {
+	for {
+		<- start
+		time.Sleep(serviceDuration) // "work"
+		done <- true
 	}
-
 }
 
 // startWebserver for all object requests
 func startWebserver() {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		pipe <- req{ time.Now(),w, r}
+		// finite server: bottleneck is done channel
+
+		initial := time.Now()
+		start <- true
+		// work happens here, in the queuing centre(s)
+		<- done
+		w.Write([]byte("success!\n"))
+		go func() {
+			// print in a goroutine
+			end := time.Since(initial)
+			fmt.Printf("%s %f 0.0 0.0 0 %s 200 GET\n",
+				initial.Format("2006-01-02 15:04:05.000"),
+				end.Seconds(), r.RequestURI)
+		}()
+		// return from the HandleFunc sends/closes the response
+
+		// infinite number of servers...
+		//initial := time.Now()
+		//time.Sleep(serviceDuration)
+		//w.Write(nil)
+		//end := time.Since(initial)
+		//fmt.Printf("%s %f 0.0 0.0 0 %s 200 GET\n",
+		//	initial.Format("2006-01-02 15:04:05.000"),
+		//	end.Seconds(), r.RequestURI)
 	})
-	err := http.ListenAndServe(host, nil) // nolint
+	err := http.ListenAndServe(host, nil)
 	if err != nil {
 		log.Fatal("ListenAndServe: ", err)
 	}
@@ -87,11 +95,14 @@ func runSmokeTest() {
 	if err != nil {
 		panic(fmt.Sprintf("Got an error in the get: %v", err))
 	}
-	_, err =  ioutil.ReadAll(resp.Body)
+	body, err :=  ioutil.ReadAll(resp.Body)
 	if err != nil {
 		panic(fmt.Sprintf("Got an error in the body read: %v", err))
 	}
-	t.Printf("\n%s\n", responseToString(resp))
+	if verbose {
+		fmt.Printf("\n%s\n", responseToString(resp))
+		fmt.Printf("\n%s\n", bodyToString(body))
+	}
 	err = resp.Body.Close()
 	if err != nil {
 		panic(fmt.Sprintf("Got an error in the body close: %v", err))
