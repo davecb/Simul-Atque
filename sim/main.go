@@ -1,26 +1,25 @@
 package main
 
 import (
-	"net/http/httputil"
+	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
-	"time"
-	"flag"
+	"net/http/httputil"
 	"strconv"
+	"time"
 )
 
 var start = make(chan bool)
 var done = make(chan bool)
-var port = 5280
-var serviceTime = 100.0  // milliseconds
+var port = 5280         // overrides port in host, below
+var serviceTime = 100.0 // milliseconds
 var serviceDuration time.Duration
 var queuingCenters = 1
 var bytes = 0
 var host = ":5280"
 var verbose = false
-
 
 // main starts the web server, and also a smoke test for it
 func main() {
@@ -46,7 +45,7 @@ func main() {
 // queuingCenter gets work, does it and reports completion
 func queuingCenter(start, done chan bool) {
 	for {
-		<- start
+		<-start
 		time.Sleep(serviceDuration) // "work"
 		done <- true
 	}
@@ -55,26 +54,27 @@ func queuingCenter(start, done chan bool) {
 // startWebserver for all object requests
 func startWebserver() {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// finite server: bottleneck is done channel
+		// finite server: bottleneck is the queuing center
 
-		initial := time.Now()
 		start <- true
-		// work happens here, in the queuing centre(s)
-		<- done
-		w.Write([]byte("success!\n"))
-		go func() {
+		initial := time.Now()
+		// work happens between start and done
+		// FIXME what correlates start with done pipelines???
+		<-done
+		end := time.Since(initial)
+		_, _ = w.Write([]byte("success!\n"))
+		go func(end time.Duration) {
 			// print in a goroutine
-			end := time.Since(initial)
 			fmt.Printf("%s %f 0.0 0.0 0 %s 200 GET\n",
 				initial.Format("2006-01-02 15:04:05.000"),
 				end.Seconds(), r.RequestURI)
-		}()
+		}(end)
 		// return from the HandleFunc sends/closes the response
 
-		// infinite number of servers...
+		// for an infinite number of servers...
 		//initial := time.Now()
 		//time.Sleep(serviceDuration)
-		//w.Write(nil)
+		//w.Write([]byte("success!\n")
 		//end := time.Since(initial)
 		//fmt.Printf("%s %f 0.0 0.0 0 %s 200 GET\n",
 		//	initial.Format("2006-01-02 15:04:05.000"),
@@ -86,27 +86,35 @@ func startWebserver() {
 	}
 }
 
-
 // runSmokeTest checks that the server is up, panics if not
 func runSmokeTest() {
+	fmt.Printf("one-line smoke test starting\n")
+
 	time.Sleep(time.Second * 2)
 	key := "albert/the/alligator.html"
 	resp, err := http.Get("http://" + host + "/" + key)
 	if err != nil {
+		printResponses(resp, []byte("n/a"))
 		panic(fmt.Sprintf("Got an error in the get: %v", err))
 	}
-	body, err :=  ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		printResponses(resp, body)
 		panic(fmt.Sprintf("Got an error in the body read: %v", err))
 	}
 	if verbose {
-		fmt.Printf("\n%s\n", responseToString(resp))
-		fmt.Printf("\n%s\n", bodyToString(body))
 	}
 	err = resp.Body.Close()
 	if err != nil {
+		printResponses(resp, body)
 		panic(fmt.Sprintf("Got an error in the body close: %v", err))
 	}
+	fmt.Printf("one-line smoke test complete\n")
+}
+
+func printResponses(resp *http.Response, body []byte) {
+	fmt.Printf("\n%s\n", responseToString(resp))
+	fmt.Printf("\n%s\n", bodyToString(body))
 }
 
 // requestToString provides extra information about an http request if it can
